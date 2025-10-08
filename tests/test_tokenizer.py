@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import resource
+# import resource
 import sys
 
 import psutil
 import pytest
 import tiktoken
+
+# refector memory_limit for usage on win11
+import threading
+import time
+from typing import Callable, Optional
 
 from .adapters import get_tokenizer
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
@@ -16,25 +21,82 @@ VOCAB_PATH = FIXTURES_PATH / "gpt2_vocab.json"
 MERGES_PATH = FIXTURES_PATH / "gpt2_merges.txt"
 
 
-def memory_limit(max_mem):
-    def decorator(f):
+# def memory_limit(max_mem):
+#     def decorator(f):
+#         def wrapper(*args, **kwargs):
+#             process = psutil.Process(os.getpid())
+#             prev_limits = resource.getrlimit(resource.RLIMIT_AS)
+#             resource.setrlimit(resource.RLIMIT_AS, (process.memory_info().rss + max_mem, -1))
+#             try:
+#                 result = f(*args, **kwargs)
+#                 return result
+#             finally:
+#                 # Even if the function above fails (e.g., it exceeds the
+#                 # memory limit), reset the memory limit back to the
+#                 # previous limit so other tests aren't affected.
+#                 resource.setrlimit(resource.RLIMIT_AS, prev_limits)
+
+#         return wrapper
+
+#     return decorator
+def memory_limit(max_mem: int):
+    """
+    Decorator to monitor and optionally enforce memory limits on Windows.
+    Note: Windows doesn't support hard memory limits like Unix RLIMIT_AS,
+    so this monitors memory usage and can raise an exception if exceeded.
+    """
+    def decorator(f: Callable):
         def wrapper(*args, **kwargs):
             process = psutil.Process(os.getpid())
-            prev_limits = resource.getrlimit(resource.RLIMIT_AS)
-            resource.setrlimit(resource.RLIMIT_AS, (process.memory_info().rss + max_mem, -1))
+            initial_memory = process.memory_info().rss
+            max_allowed = initial_memory + max_mem
+            
+            # Flag to track if memory limit was exceeded
+            memory_exceeded = False
+            exception_msg = ""
+            
+            def memory_monitor():
+                """Background thread to monitor memory usage"""
+                nonlocal memory_exceeded, exception_msg
+                while not memory_exceeded:
+                    try:
+                        current_memory = process.memory_info().rss
+                        if current_memory > max_allowed:
+                            memory_exceeded = True
+                            exception_msg = f"Memory limit exceeded: {current_memory} > {max_allowed}"
+                            # Try to interrupt the main thread
+                            # Note: This won't actually stop the function execution
+                            break
+                        time.sleep(0.1)  # Check every 100ms
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        break
+            
+            # Start memory monitoring in a daemon thread
+            monitor_thread = threading.Thread(target=memory_monitor, daemon=True)
+            monitor_thread.start()
+            
             try:
                 result = f(*args, **kwargs)
+                
+                # Check if memory was exceeded during execution
+                if memory_exceeded:
+                    raise MemoryError(exception_msg)
+                    
                 return result
+                
+            except MemoryError:
+                # Re-raise MemoryErrors that might occur naturally
+                if memory_exceeded:
+                    raise MemoryError(exception_msg)
+                else:
+                    raise
+                    
             finally:
-                # Even if the function above fails (e.g., it exceeds the
-                # memory limit), reset the memory limit back to the
-                # previous limit so other tests aren't affected.
-                resource.setrlimit(resource.RLIMIT_AS, prev_limits)
+                # Cleanup - the daemon thread will exit automatically
+                pass
 
         return wrapper
-
     return decorator
-
 
 def get_tokenizer_from_vocab_merges_path(
     vocab_path: str | os.PathLike,
